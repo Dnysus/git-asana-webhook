@@ -5,7 +5,7 @@
 # the app binds to $PORT (default 8080) and shuts down gracefully on SIGTERM.
 
 # ── Stage 1: build — compile TypeScript with the full dependency tree ───────
-FROM node:24-alpine AS build
+FROM node:26-alpine AS build
 WORKDIR /app
 
 COPY package.json package-lock.json ./
@@ -16,14 +16,14 @@ COPY src ./src
 RUN npm run build
 
 # ── Stage 2: deps — production-only node_modules ────────────────────────────
-FROM node:24-alpine AS deps
+FROM node:26-alpine AS deps
 WORKDIR /app
 
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev --ignore-scripts && npm cache clean --force
 
 # ── Stage 3: runtime — minimal final image ──────────────────────────────────
-FROM node:24-alpine AS runtime
+FROM node:26-alpine AS runtime
 ENV NODE_ENV=production
 WORKDIR /app
 
