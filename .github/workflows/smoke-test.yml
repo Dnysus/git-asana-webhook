@@ -1,0 +1,109 @@
+name: Smoke Test
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+
+permissions:
+  contents: read
+
+# Cancel superseded runs when a PR is pushed to repeatedly.
+concurrency:
+  group: smoke-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Run smoke tests
+        run: |
+          set -euo pipefail
+
+          export PORT=8081
+          export GITHUB_WEBHOOK_SECRET=testsecret
+          export ASANA_ACCESS_TOKEN=dummy
+          export ASANA_WORKSPACE_GID=1
+          export ASANA_TICKET_KEY_FIELD_GID=11
+          export ASANA_PR_STATUS_FIELD_GID=21
+          export ASANA_PR_STATUS_OPEN_GID=22
+          export ASANA_PR_STATUS_MERGED_GID=23
+          export ASANA_PR_STATUS_CLOSED_GID=24
+          export ASANA_CI_STATUS_FIELD_GID=31
+          export ASANA_CI_STATUS_PENDING_GID=32
+          export ASANA_CI_STATUS_PASSED_GID=33
+          export ASANA_CI_STATUS_FAILED_GID=34
+          BASE="http://localhost:$PORT"
+
+          fail() {
+            echo "::error::$1"
+            echo '--- server log ---'
+            cat /tmp/server.log 2>/dev/null || true
+            exit 1
+          }
+
+          # HMAC-SHA256 signature GitHub would attach to the given body.
+          sign() {
+            node -e 'const {createHmac}=require("node:crypto");console.log("sha256="+createHmac("sha256",process.env.GITHUB_WEBHOOK_SECRET).update(process.argv[1]).digest("hex"))' "$1"
+          }
+
+          node dist/index.js >/tmp/server.log 2>&1 &
+          SERVER_PID=$!
+          trap 'kill "$SERVER_PID" 2>/dev/null || true' EXIT
+
+          # 1. Server becomes ready and /healthz responds
+          ready=false
+          for _ in $(seq 1 50); do
+            if curl -sf "$BASE/healthz" >/dev/null 2>&1; then ready=true; break; fi
+            sleep 0.2
+          done
+          [ "$ready" = true ] || fail "server did not become ready on $BASE"
+          echo "PASS: /healthz responds"
+
+          # 2. Unsigned delivery is rejected
+          code=$(curl -s -o /tmp/resp.json -w '%{http_code}' -X POST \
+            -H 'content-type: application/json' -d '{}' "$BASE/webhook")
+          [ "$code" = "401" ] || fail "unsigned delivery: expected 401, got $code"
+          echo "PASS: unsigned delivery rejected with 401"
+
+          # 3. Signed but unhandled event (ping) is acknowledged and ignored
+          body='{"zen":"Keep it logically awesome."}'
+          code=$(curl -s -o /tmp/resp.json -w '%{http_code}' -X POST \
+            -H 'content-type: application/json' \
+            -H 'x-github-event: ping' \
+            -H "x-hub-signature-256: $(sign "$body")" \
+            -d "$body" "$BASE/webhook")
+          [ "$code" = "200" ] || fail "signed ping: expected 200, got $code"
+          jq -e '.outcome == "ignored"' /tmp/resp.json >/dev/null \
+            || fail "signed ping: expected outcome=ignored, got $(cat /tmp/resp.json)"
+          echo "PASS: signed ping acknowledged and ignored"
+
+          # 4. Signed pull_request is routed and the short-ID is extracted
+          #    ("edited" is an unmapped action, so no Asana call is attempted)
+          body='{"action":"edited","pull_request":{"number":7,"title":"CENG-1234 add login flow","html_url":"https://github.com/acme/app/pull/7","user":{"login":"octocat"},"head":{"ref":"feature/no-id-here"}},"repository":{"full_name":"acme/app"},"sender":{"login":"octocat"}}'
+          code=$(curl -s -o /tmp/resp.json -w '%{http_code}' -X POST \
+            -H 'content-type: application/json' \
+            -H 'x-github-event: pull_request' \
+            -H "x-hub-signature-256: $(sign "$body")" \
+            -d "$body" "$BASE/webhook")
+          [ "$code" = "200" ] || fail "signed pull_request: expected 200, got $code"
+          jq -e '.outcome == "ignored" and .shortId == "CENG-1234"' /tmp/resp.json >/dev/null \
+            || fail "signed pull_request: expected shortId=CENG-1234, got $(cat /tmp/resp.json)"
+          echo "PASS: signed pull_request routed and short-ID extracted"
+
+          echo "All smoke tests passed."
