@@ -1,0 +1,12 @@
+# Dependencies & build output
+node_modules/
+dist/
+
+# Local environment files (never commit secrets)
+.env
+.env.*
+!.env.example
+
+# Logs & OS noise
+*.log
+.DS_Store
